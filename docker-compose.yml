@@ -1,0 +1,37 @@
+services:
+  mlflow:
+    image: python:3.12-slim
+    working_dir: /mlflow
+    volumes:
+      - ./mlruns:/mlflow/mlruns
+      - ./mlflow.db:/mlflow/mlflow.db
+    ports:
+      - "5001:5000"
+    environment:
+      - MLFLOW_HOST=0.0.0.0
+      - MLFLOW_PORT=5000
+      - MLFLOW_SERVER_ALLOWED_HOSTS=*
+    command: >
+      bash -c "pip install mlflow==3.10.1 --quiet &&
+               mlflow server
+               --backend-store-uri sqlite:////mlflow/mlflow.db
+               --default-artifact-root /mlflow/mlruns"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  fastapi:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./mlruns:/Users/edmund/mlops-project/mlruns
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    restart: on-failure
