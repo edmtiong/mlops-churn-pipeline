@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mlflow-config
+  namespace: mlops-app
+data:
+  MLFLOW_S3_ENDPOINT_URL: "http://minio.mlops-data.svc.cluster.local:9000"
+  MLFLOW_TRACKING_URI: "http://mlflow.mlops-app.svc.cluster.local:5001"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fastapi-config
+  namespace: mlops-app
+data:
+  MLFLOW_S3_ENDPOINT_URL: "http://minio.mlops-data.svc.cluster.local:9000"
+  MLFLOW_TRACKING_URI: "http://mlflow.mlops-app.svc.cluster.local:5001"
+  MODEL_NAME: "churn-model"
+
