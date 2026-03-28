@@ -19,6 +19,13 @@ spec:
           imagePullPolicy: Never
           ports:
             - containerPort: 8000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
           env:
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
