@@ -21,6 +21,17 @@ spec:
           env:
             - name: GF_SECURITY_ADMIN_PASSWORD
               value: "admin"
+            #- name: GF_SERVER_ROOT_URL
+            #  value: "http://127.0.0.1/grafana/"
+            #- name: GF_SERVER_SERVE_FROM_SUB_PATH
+            #  value: "true"
+          volumeMounts:
+            - name : grafana-storage
+              mountPath: /var/lib/grafana
+      volumes:
+        - name: grafana-storage
+          persistentVolumeClaim:
+            claimName: grafana-pvc
 ---
 apiVersion: v1
 kind: Service
@@ -33,4 +44,15 @@ spec:
   ports:
     - port: 3000
       targetPort: 3000
-  type: ClusterIP
+  type: LoadBalancer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: mlops-app
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
