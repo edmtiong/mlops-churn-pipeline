@@ -1,67 +1,138 @@
-# MLOps Churn Prediction Pipeline
+# ML Platform — Model Lifecycle and Serving Infrastructure
 
-A full ML platform deployed on Kubernetes, built to mirror production MLOps patterns.
+A self-hosted platform for training, registering, promoting, serving, and monitoring ML models on Kubernetes.
 
-## Flow
+Built to answer a specific question: **what does it actually take to put a model into production when you have to be able to prove, afterwards, how it got there?** The modelling problem is deliberately trivial. The lifecycle around it is the subject.
 
-```
-[ Data ] → [ Train ] → [ Register ] → [ Promote @champion ]
-                                                ↓
-[ Response ] ← [ Request ] ← [ Monitor ] ← [ Serve ]
-      ↓
-[ Retrain (Prefect, Mon 2am) ] - - - - - - - ↑
-```
-
-## Stack
-
-| Layer | Tools |
-|---|---|
-| Serving | FastAPI, Kubernetes, Nginx Ingress, HPA |
-| Experiment tracking | MLflow, PostgreSQL, MinIO |
-| Orchestration | Prefect (weekly retraining, cron) |
-| Observability | Prometheus, Grafana |
-| CI/CD | GitHub Actions, Docker |
-
-## Model performance
-
-| Metric | Value |
-|---|---|
-| ROC-AUC | 0.84 |
-| p95 latency | ~30ms (warm) |
-| Algorithm | Logistic Regression pipeline |
+Demonstrated on a customer churn dataset.
 
 ---
 
-## Prerequisites
+## What this demonstrates
 
-- Docker + Docker Compose
-- minikube + kubectl (for Kubernetes deployment)
-- Python 3.12+
+- **Model registry with a promotion path** — champion/challenger staging in MLflow, so a new model replaces a live one through a defined transition rather than a redeploy.
+- **Zero-downtime promotion** — serving reads the champion alias from the registry; promotion does not restart the serving pods.
+- **Scheduled retraining as an isolated workload** — retraining runs in its own container on its own schedule, and cannot take the serving path down with it.
+- **Autoscaled inference** — FastAPI behind an nginx ingress with an HPA scaling 1→5 replicas on load.
+- **Operational observability** — p95 latency, request rate, and prediction distribution instrumented in Prometheus and surfaced in Grafana.
+- **Reproducible from zero** — one command locally, one manifest set on Kubernetes.
 
 ---
 
-## Option 1 — Run locally with Docker Compose
+## Architecture
 
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/edmtiong/mlops-churn-pipeline.git
-cd mlops-churn-pipeline
+```
+                          ┌─────────────────────────────┐
+                          │  namespace: mlops-data      │
+   ┌──────────┐  train    │  ┌────────┐   ┌───────────┐ │
+   │ Prefect  │──────────▶│  │ MLflow │──▶│ PostgreSQL│ │  metadata
+   │ retrain  │  register │  │ server │   └───────────┘ │
+   │ (cron)   │           │  │        │──▶┌───────────┐ │  artifacts
+   └──────────┘           │  └────────┘   │   MinIO   │ │
+        ▲                 │       ▲       └───────────┘ │
+        │                 └───────┼─────────────────────┘
+        │                         │ load @champion
+        │                 ┌───────┴─────────────────────┐
+        │                 │  namespace: mlops-app       │
+        │                 │  ┌─────────┐   ┌──────────┐ │
+   ┌────┴─────┐           │  │ FastAPI │◀──│ Ingress  │◀─── requests
+   │ schedule │           │  │  (HPA   │   │  nginx   │ │
+   │ Mon 02:00│           │  │  1–5)   │   └──────────┘ │
+   └──────────┘           │  └────┬────┘                │
+                          │       │ /metrics            │
+                          │  ┌────▼───────┐  ┌────────┐ │
+                          │  │ Prometheus │─▶│ Grafana│ │
+                          │  └────────────┘  └────────┘ │
+                          └─────────────────────────────┘
 ```
 
-### 2. Start all services
+Namespaces separate stateful platform services (`mlops-data`) from the request path (`mlops-app`), so serving can be scaled, restarted, or rolled back without touching the registry or its backing stores.
+
+> **[ADD SCREENSHOT: `kubectl get pods -A` showing both namespaces healthy]**
+
+---
+
+## Design decisions
+--- To be filled
+
+## Model lifecycle
+
+```
+train ──▶ log run ──▶ register version ──▶ @challenger ──▶ [evaluation] ──▶ @champion
+                                                                              │
+                                                        serving reads ────────┘
+```
+
+Retraining runs weekly (Mondays, 02:00) via a Prefect cron schedule. Each run logs a new registered version. Promotion to `@champion` is the controlled step — serving resolves the champion alias at load, so promotion takes effect without a redeploy and rollback is a single alias change.
+
+Manual trigger:
 
 ```bash
+kubectl exec -n mlops-app deployment/prefect -- \
+  prefect deployment run 'churn-retraining/churn-retraining-deployment'
+```
+
+> **[ADD SCREENSHOT: MLflow registry showing two versions with @champion and @challenger aliases]**
+
+---
+
+## Observability
+
+| Metric | Why it's instrumented |
+|---|---|
+| p95 inference latency | Tail latency is what breaks SLAs; the mean hides it |
+| Request rate | Drives HPA scaling behaviour and shows whether autoscaling responds to real load |
+| Prediction distribution | A shift in output distribution is the earliest cheap signal that inputs have changed — a precursor to proper drift detection |
+
+Measured p95 is ~30ms warm, on a single-node minikube cluster. This is a local-cluster figure, not a production benchmark.
+
+> **[ADD SCREENSHOT: Grafana dashboard under load, showing latency and request rate]**
+> **[ADD SCREENSHOT: `kubectl get hpa` mid-scale, showing replica count above 1]**
+
+---
+
+## Known limitations
+
+Stated deliberately. This is a demonstration platform, not a production deployment.
+
+- **Single-node minikube.** No multi-node scheduling, no pod anti-affinity, no real failure-domain separation. HPA scaling is demonstrated, not stress-tested.
+- **No authentication on the inference endpoint.** `/predict` is open. A real deployment needs authn/authz at the ingress and per-caller rate limiting.
+- **Local credentials are defaults.** `minioadmin/minioadmin` and `admin/admin` are fine for a laptop and unacceptable anywhere else. Kubernetes secrets are applied from plaintext manifests; a real deployment needs sealed secrets or an external secret store.
+- **No automated evaluation gate.** Promotion to `@champion` is currently a manual decision. Nothing programmatically blocks a worse model from being promoted. *(Next on the roadmap — see below.)*
+- **No drift detection.** Prediction distribution is observed but nothing acts on it; there is no input-drift monitoring and no drift-triggered retraining.
+- **Infrastructure is not declarative end-to-end.** Manifests are applied by hand. No Terraform, no GitOps reconciliation.
+- **Retraining uses a fixed dataset.** There is no upstream data pipeline, so "retraining" re-fits on the same data rather than on new arrivals.
+- **Model quality is not the point.** ROC-AUC 0.84 from a logistic regression on a public churn dataset is unremarkable and intended to be. Its role here is as a *threshold* — a number the evaluation gate can enforce against — not as a result.
+
+---
+
+## Roadmap
+
+| Status | Item |
+|---|---|
+| In progress | **CI evaluation gate** — score the challenger against a versioned held-out set and block promotion on metric regression beyond threshold |
+| Planned | Input-drift detection, and retraining triggered by drift rather than by cron |
+| Planned | Terraform for cluster and platform provisioning |
+| Planned | Load-test harness with published latency-under-concurrency curves |
+
+---
+
+## Running it
+
+<details>
+<summary><b>Option 1 — Docker Compose (local)</b></summary>
+
+**Prerequisites:** Docker + Docker Compose, Python 3.12+
+
+```bash
+git clone https://github.com/edmtiong/ml-lifecycle-platform.git
+cd ml-lifecycle-platform
 docker compose up --build
 ```
 
-This starts Postgres, MinIO, MLflow, FastAPI, Prometheus, and Grafana.
-Wait until all services are healthy before proceeding (~60s for MLflow).
+Starts Postgres, MinIO, MLflow, FastAPI, Prometheus, and Grafana. Allow ~60s for MLflow to become healthy.
 
-### 3. Train and register the initial model
-
-The first time you run the stack, MLflow has no model registered yet.
-Run the training pipeline to train and register the champion model:
+Train and register the initial champion (MLflow starts with an empty registry):
 
 ```bash
 export MLFLOW_TRACKING_URI=http://127.0.0.1:5001
@@ -73,41 +144,29 @@ pip install -r requirements.txt
 python src/pipelines/retrain_flow.py
 ```
 
-Or use the helper script:
-
-```bash
-bash start.sh
-```
-
-### 4. Services
+Or: `bash start.sh`
 
 | Service | URL |
 |---|---|
 | FastAPI | http://localhost:8000 |
 | MLflow | http://localhost:5001 |
-| Grafana | http://localhost:3000 (admin/admin) |
+| Grafana | http://localhost:3000 |
 | Prometheus | http://localhost:9090 |
-| MinIO console | http://localhost:9001 (minioadmin/minioadmin) |
+| MinIO console | http://localhost:9001 |
 
----
+Default local credentials are `admin/admin` (Grafana) and `minioadmin/minioadmin` (MinIO). Local development only.
 
-## Option 2 — Deploy on Kubernetes (minikube)
+</details>
 
-### 1. Clone the repo
+<details>
+<summary><b>Option 2 — Kubernetes (minikube)</b></summary>
 
-```bash
-git clone https://github.com/edmtiong/mlops-churn-pipeline.git
-cd mlops-churn-pipeline
-```
-
-### 2. Start minikube
+**Prerequisites:** minikube + kubectl, Python 3.12+
 
 ```bash
 minikube start --driver=docker --kubernetes-version=v1.32.0
-minikube tunnel  # keep running in a separate terminal
+minikube tunnel   # keep running in a separate terminal
 ```
-
-### 3. Apply manifests
 
 ```bash
 kubectl apply -f k8s/namespaces/
@@ -119,7 +178,7 @@ kubectl apply -f k8s/monitoring/
 kubectl apply -f k8s/ingress/
 ```
 
-### 4. Verify cluster
+Verify:
 
 ```bash
 kubectl get pods -n mlops-app
@@ -127,7 +186,7 @@ kubectl get pods -n mlops-data
 kubectl get hpa -n mlops-app
 ```
 
-### 5. Train and register the initial model
+Train and register the initial champion:
 
 ```bash
 export MLFLOW_TRACKING_URI=http://127.0.0.1/mlflow
@@ -139,20 +198,17 @@ pip install -r requirements.txt
 python src/pipelines/retrain_flow.py
 ```
 
-### 6. Services
-
 | Service | URL |
 |---|---|
 | FastAPI | http://127.0.0.1/fastapi/health |
 | MLflow | http://127.0.0.1/mlflow |
-| Grafana | http://127.0.0.1:3000 (admin/admin) |
+| Grafana | http://127.0.0.1:3000 |
 | Prometheus | http://127.0.0.1/prometheus |
 
----
+</details>
 
-## Run a prediction
-
-### Docker Compose
+<details>
+<summary><b>Run a prediction</b></summary>
 
 ```bash
 curl -X POST http://localhost:8000/predict \
@@ -171,39 +227,22 @@ curl -X POST http://localhost:8000/predict \
   }'
 ```
 
-### Kubernetes
-
-```bash
-curl -X POST http://127.0.0.1/fastapi/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-    "CreditScore": 600,
-    "Age": 40,
-    "Tenure": 5,
-    "Balance": 50000,
-    "NumOfProducts": 2,
-    "HasCrCard": 1,
-    "IsActiveMember": 1,
-    "EstimatedSalary": 80000,
-    "Geography": "France",
-    "Gender": "Male"
-  }'
-```
-
-Expected response:
-
 ```json
 {"churn_probability": 0.23, "prediction": 0}
 ```
 
+On Kubernetes, substitute `http://127.0.0.1/fastapi/predict`.
+
+</details>
+
 ---
 
-## Trigger retraining manually
+## Stack
 
-Retraining runs automatically every Monday at 2am via Prefect cron schedule.
-To trigger it manually:
-
-```bash
-kubectl exec -n mlops-app deployment/prefect -- \
-  prefect deployment run 'churn-retraining/churn-retraining-deployment'
-```
+| Layer | Tools |
+|---|---|
+| Serving | FastAPI, Kubernetes, nginx Ingress, HPA |
+| Registry & tracking | MLflow, PostgreSQL, MinIO |
+| Orchestration | Prefect |
+| Observability | Prometheus, Grafana |
+| CI/CD | GitHub Actions, Docker |
